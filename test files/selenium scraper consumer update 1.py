@@ -45,17 +45,18 @@ class DatabaseManager:
 
     def create_table(self):
         self.cur.execute("""
-            CREATE TABLE IF NOT EXISTS scraped_records_test (
+            CREATE TABLE IF NOT EXISTS customer_detail_records (
               protocollo TEXT PRIMARY KEY,
-              avanzamento TEXT,
-              inserita_il DATE,
-              prodotto TEXT,
-              assegnata_a TEXT,
-              richiedente TEXT,
-              referente TEXT,
-              cliente TEXT,
-              progetto TEXT,
-              collegato_a TEXT,
+              indirizzo TEXT,
+              sesso TEXT,
+              ateco TEXT,
+              codice_fiscale TEXT,
+              legale_rappresentante TEXT,
+              telefono TEXT,
+              settore TEXT,
+              partita_iva TEXT,
+              codice_fiscale_legale_rappresentante TEXT,
+              email TEXT,
               content_hash TEXT UNIQUE
             )
         """)
@@ -63,45 +64,43 @@ class DatabaseManager:
 
     def protocollo_exists(self, protocollo):
         self.cur.execute(
-            "SELECT 1 FROM scraped_records_test WHERE protocollo = %s", (protocollo,)
+            "SELECT 1 FROM customer_detail_records WHERE protocollo = %s", (protocollo,)
         )
         return self.cur.fetchone() is not None
 
     def hash_exists(self, content_hash):
         self.cur.execute(
-            "SELECT 1 FROM scraped_records_test WHERE content_hash = %s", (content_hash,)
+            "SELECT 1 FROM customer_detail_records WHERE content_hash = %s", (content_hash,)
         )
         return self.cur.fetchone() is not None
 
     def insert_records_batch(self, records):
-        # records: list of tuples (record_dict, content_hash)
         insert_data = []
         for record, content_hash in records:
             insert_data.append((
                 record["protocollo"],
-                record["avanzamento"],
-                datetime.strptime(record["inserita il"], "%d/%m/%Y %H:%M").date(),
-                record["prodotto"],
-                record["assegnata a"],
-                record["richiedente"],
-                record["referente destinatario"],
-                record["cliente"],
-                record["progetto"],
-                record["collegato a"],
+                record["indirizzo"],
+                record["sesso"],
+                record["ateco"],
+                record["codice_fiscale"],
+                record["legale_rappresentante"],
+                record["telefono"],
+                record["settore"],
+                record["partita_iva"],
+                record["codice_fiscale_legale_rappresentante"],
+                record["email"],
                 content_hash,
             ))
         self.cur.executemany(
             """
-            INSERT INTO scraped_records_test (
-              protocollo, avanzamento, inserita_il,
-              prodotto, assegnata_a, richiedente,
-              referente, cliente, progetto,
-              collegato_a, content_hash
+            INSERT INTO customer_detail_records (
+              protocollo, indirizzo, sesso, ateco,
+              codice_fiscale, legale_rappresentante, telefono, settore,
+              partita_iva, codice_fiscale_legale_rappresentante, email, content_hash
             ) VALUES (
-              %s, %s, %s,
-              %s, %s, %s,
-              %s, %s, %s,
-              %s, %s
+              %s, %s, %s, %s,
+              %s, %s, %s, %s,
+              %s, %s, %s, %s
             ) ON CONFLICT (protocollo) DO NOTHING
             """,
             insert_data,
@@ -175,24 +174,33 @@ class SeleniumHelper:
 
     @staticmethod
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
-    def extract_detail_data(wait):
+    def extract_customer_detail_panel(wait):
         try:
             panel = wait.until(
-                EC.visibility_of_element_located((By.ID, "module:j_id1410"))
+                EC.visibility_of_element_located((By.CLASS_NAME, "detail-panel"))
             )
-            keys = panel.find_elements(By.CSS_SELECTOR, "span.detail-title")
-            rows = panel.find_elements(By.CLASS_NAME, "icePnlGrdRow2")
-            values = []
-            for row in rows:
-                for cell in row.find_elements(By.TAG_NAME, "td"):
-                    values.append(cell.text.strip())
-            values.pop(0)
+            # Extract all tables in the detail-panel
+            tables = panel.find_elements(By.TAG_NAME, "table")
             data = {}
-            for i, key in enumerate(keys):
-                data[key.text.strip().lower()] = values[i]
+            for table in tables:
+                # Get all rows
+                rows = table.find_elements(By.TAG_NAME, "tr")
+                if len(rows) < 2:
+                    continue
+                # Get all keys from first row
+                keys = [td.text.strip().lower().replace(" ", "_") for td in rows[0].find_elements(By.TAG_NAME, "span") if td.text.strip()]
+                # Get all values from second row
+                values = [td.text.strip() for td in rows[1].find_elements(By.TAG_NAME, "span") if td.text.strip() or td.text == "-"]
+                # If values are empty, try to get text from td directly
+                if not values:
+                    values = [td.text.strip() for td in rows[1].find_elements(By.TAG_NAME, "td")]
+                # Map keys to values
+                for i, key in enumerate(keys):
+                    if i < len(values):
+                        data[key] = values[i]
             return data
         except Exception as e:
-            logging.error(f"Extraction error: {e}", exc_info=True)
+            logging.error(f"Customer detail extraction error: {e}", exc_info=True)
             return None
 
 class FormSubmitter:
@@ -219,15 +227,16 @@ class FormSubmitter:
             else:
                 raise Exception("Login failed after 3 attempts: wrong username or password")
 
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "avanzamento"), data["avanzamento"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "inserita-il"), data["inserita-il"].strftime("%Y-%m-%d"))
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "prodotto"), data["prodotto"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "assegnata-a"), data["assegnata-a"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "richiedente"), data["richiedente"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "referente"), data["referente"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "cliente"), data["cliente"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "progetto"), data["progetto"])
-            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "collegato-a"), data["collegato-a"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "indirizzo"), data["indirizzo"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "sesso"), data["sesso"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "ateco"), data["ateco"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "codice_fiscale"), data["codice_fiscale"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "legale_rappresentante"), data["legale_rappresentante"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "telefono"), data["telefono"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "settore"), data["settore"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "partita_iva"), data["partita_iva"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "codice_fiscale_legale_rappresentante"), data["codice_fiscale_legale_rappresentante"])
+            SeleniumHelper.safe_send_keys(driver.find_element(By.ID, "email"), data["email"])
             SeleniumHelper.click(driver, driver.find_element(By.CSS_SELECTOR, "button[type='submit']"))
 
             return True
@@ -260,7 +269,6 @@ class Scraper:
         try:
             self.driver.get(os.getenv("OMNIA_URL"))
 
-            # Reduce Selenium waits: use shorter timeouts for elements that should appear quickly
             for tab in ["navigationForm:portfolio", "navigationForm:opportunities", "navigationForm:requestsDashboard"]:
                 try:
                     WebDriverWait(self.driver, 7).until(EC.element_to_be_clickable((By.ID, tab))).click()
@@ -288,56 +296,70 @@ class Scraper:
                 except Exception:
                     SeleniumHelper.click(self.driver, button)
 
-                record = SeleniumHelper.extract_detail_data(self.wait)
-                if not record:
+                # Wait for detail-panel to load
+                detail_panel = self.wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "detail-panel")))
+
+                # Click the link below CLIENTE to open the new detail-panel
+                try:
+                    cliente_link = detail_panel.find_element(By.XPATH, ".//span[text()='Cliente']/ancestor::td/following-sibling::td//a")
+                    SeleniumHelper.click(cliente_link)
+                except Exception as e:
+                    logging.error(f"Could not click Cliente link: {e}", exc_info=True)
                     continue
 
-                record["protocollo"] = protocollo
-                content_hash = HashUtil.hash_content(record)
+                # Wait for new detail-panel to appear (assume only one visible at a time)
+                customer_data = SeleniumHelper.extract_customer_detail_panel(self.wait)
+                if not customer_data:
+                    continue
+
+                customer_data["protocollo"] = protocollo
+                content_hash = HashUtil.hash_content(customer_data)
 
                 if self.db.hash_exists(content_hash):
                     print(f"Duplicate hash for {protocollo}, skipping insert")
                     logging.warning(f"Duplicate hash for {protocollo}, skipping insert")
                     continue
 
-                batch_records.append((record, content_hash))
+                batch_records.append((customer_data, content_hash))
 
+                # Prepare data for form submission
                 new_data_to_send.append({
-                    "avanzamento": record["avanzamento"],
-                    "inserita-il": datetime.strptime(record["inserita il"], "%d/%m/%Y %H:%M").date(),
-                    "prodotto": record["prodotto"],
-                    "assegnata-a": record["assegnata a"],
-                    "richiedente": record["richiedente"],
-                    "referente": record["referente destinatario"],
-                    "cliente": record["cliente"],
-                    "progetto": record["progetto"],
-                    "collegato-a": record["collegato a"]
+                    "indirizzo": customer_data.get("indirizzo", ""),
+                    "sesso": customer_data.get("sesso", ""),
+                    "ateco": customer_data.get("ateco", ""),
+                    "codice_fiscale": customer_data.get("codice_fiscale", ""),
+                    "legale_rappresentante": customer_data.get("legale_rappresentante", ""),
+                    "telefono": customer_data.get("telefono", ""),
+                    "settore": customer_data.get("settore", ""),
+                    "partita_iva": customer_data.get("partita_iva", ""),
+                    "codice_fiscale_legale_rappresentante": customer_data.get("codice_fiscale_legale_rappresentante", ""),
+                    "email": customer_data.get("email", "")
                 })
 
-                self.notifier.show(f"Inserted new record: {record['progetto']}")
+                self.notifier.show(f"Inserted new customer record: {customer_data.get('indirizzo', '')}")
 
             # Batch insert at the end
             if batch_records:
                 self.db.insert_records_batch(batch_records)
-                logging.info(f"Inserted {len(batch_records)} new records in batch.")
+                logging.info(f"Inserted {len(batch_records)} new customer records in batch.")
 
         except Exception as e:
             logging.error(f"General scraping error: {e}", exc_info=True)
 
         finally:
             if new_data_to_send:
-                print(f"\n📤 Submitting {len(new_data_to_send)} new records to form...")
+                print(f"\n📤 Submitting {len(new_data_to_send)} new customer records to form...")
                 for rec in new_data_to_send:
                     try:
                         success = FormSubmitter.submit_form(self.driver1, rec)
                         if success:
-                            self.notifier.show(f"✅ Form submitted for: {rec['progetto']}")
-                            print(f"✅ Form submitted for: {rec['progetto']}")
-                            self.success_log.append(f"Form sent: {rec['progetto']}")
+                            self.notifier.show(f"✅ Form submitted for: {rec['indirizzo']}")
+                            print(f"✅ Form submitted for: {rec['indirizzo']}")
+                            self.success_log.append(f"Form sent: {rec['indirizzo']}")
                         else:
-                            self.failed_log.append(f"Form failed: {rec['progetto']}")
+                            self.failed_log.append(f"Form failed: {rec['indirizzo']}")
                     except Exception as e:
-                        self.failed_log.append(f"Error submitting {rec['progetto']}: {e}")
+                        self.failed_log.append(f"Error submitting {rec['indirizzo']}: {e}")
 
             with open("form_submission_report.txt", "w", encoding="utf-8") as rpt:
                 rpt.write("Successful Submissions\n=======================\n\n")
@@ -380,7 +402,7 @@ class ScrapeScheduler:
 
 if __name__ == "__main__":
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    #options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--start-maximized")
     options.add_argument("--disable-dev-shm-usage")
@@ -396,4 +418,4 @@ if __name__ == "__main__":
     notifier = PopupNotifier()
     scraper = Scraper(driver, driver1, wait, db_manager, notifier)
     scheduler = ScrapeScheduler(scraper)
-    scheduler.start(interval_seconds=20)
+    scheduler.start(interval_seconds=20)  # Adjust the interval as needed

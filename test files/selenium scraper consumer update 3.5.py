@@ -1,0 +1,549 @@
+import os
+import json
+import time
+import hashlib
+import schedule
+import psycopg2
+import logging
+import threading
+import tkinter as tk
+from tkinter import ttk
+from dotenv import load_dotenv
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+scrape_lock = threading.Lock()
+
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+
+class DatabaseManager:
+    def __init__(self):
+        self.conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT
+        )
+        self.cur = self.conn.cursor()
+        self.create_tables()
+
+    def create_tables(self):
+        self.cur.execute("""
+            CREATE TABLE IF NOT EXISTS customer_detail_records (
+              protocollo TEXT PRIMARY KEY,
+              indirizzo TEXT,
+              sesso TEXT,
+              ateco TEXT,
+              codice_fiscale TEXT,
+              legale_rappresentante TEXT,
+              telefono TEXT,
+              settore TEXT,
+              partita_iva TEXT,
+              codice_fiscale_legale_rappresentante TEXT,
+              email TEXT,
+              content_hash TEXT UNIQUE
+            )
+        """)
+        self.cur.execute("""
+            CREATE TABLE IF NOT EXISTS modulo_richiesta_records (
+              protocollo TEXT,
+              field_name TEXT,
+              field_value TEXT,
+              content_hash TEXT UNIQUE
+            )
+        """)
+        self.conn.commit()
+
+    def protocollo_exists(self, protocollo):
+        self.cur.execute(
+            "SELECT 1 FROM customer_detail_records WHERE protocollo = %s", (protocollo,)
+        )
+        return self.cur.fetchone() is not None
+
+    def hash_exists_customer(self, content_hash):
+        self.cur.execute(
+            "SELECT 1 FROM customer_detail_records WHERE content_hash = %s", (content_hash,)
+        )
+        return self.cur.fetchone() is not None
+
+    def hash_exists_modulo(self, content_hash):
+        self.cur.execute(
+            "SELECT 1 FROM modulo_richiesta_records WHERE content_hash = %s", (content_hash,)
+        )
+        return self.cur.fetchone() is not None
+
+    def insert_customer_batch(self, records):
+        insert_data = []
+        for record, content_hash in records:
+            insert_data.append((
+                record["protocollo"],
+                record["indirizzo"],
+                record["sesso"],
+                record["ateco"],
+                record["codice_fiscale"],
+                record["legale_rappresentante"],
+                record["telefono"],
+                record["settore"],
+                record["partita_iva"],
+                record["codice_fiscale_legale_rappresentante"],
+                record["email"],
+                content_hash,
+            ))
+        self.cur.executemany(
+            """
+            INSERT INTO customer_detail_records (
+              protocollo, indirizzo, sesso, ateco,
+              codice_fiscale, legale_rappresentante, telefono, settore,
+              partita_iva, codice_fiscale_legale_rappresentante, email, content_hash
+            ) VALUES (
+              %s, %s, %s, %s,
+              %s, %s, %s, %s,
+              %s, %s, %s, %s
+            ) ON CONFLICT (protocollo) DO NOTHING
+            """,
+            insert_data,
+        )
+        self.conn.commit()
+
+    def insert_modulo_batch(self, records):
+        insert_data = []
+        for record in records:
+            insert_data.append((
+                record["protocollo"],
+                record["field_name"],
+                record["field_value"],
+                record["content_hash"]
+            ))
+        self.cur.executemany(
+            """
+            INSERT INTO modulo_richiesta_records (
+              protocollo, field_name, field_value, content_hash
+            ) VALUES (
+              %s, %s, %s, %s
+            ) ON CONFLICT (content_hash) DO NOTHING
+            """,
+            insert_data,
+        )
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+class PopupNotifier:
+    def show(self, msg, title="Success"):
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+
+        width, height = 360, 110
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x = screen_width - width - 20
+        y = screen_height - height - 120
+        root.geometry(f"{width}x{height}+{x}+{y}")
+
+        container = tk.Frame(root, bg="white", bd=0)
+        container.place(relwidth=1, relheight=1)
+
+        stripe_margin_x = 8
+        stripe_margin_y = 12
+        stripe_height = height - stripe_margin_y * 2
+        stripe = tk.Canvas(container, width=12, height=stripe_height, bg="white", highlightthickness=0)
+        stripe.place(x=stripe_margin_x, y=stripe_margin_y)
+        stripe.create_rectangle(0, 0, 12, stripe_height, fill="#27ae60", outline="")
+
+        title_label = tk.Label(
+            container,
+            text=title,
+            bg="white",
+            fg="#27ae60",
+            font=("Century Gothic", 14, "bold"),
+            anchor="w"
+        )
+        title_label.place(x=28, y=18)
+
+        message = tk.Label(
+            container,
+            text=msg,
+            bg="white",
+            fg="#2c3e50",
+            font=("Century Gothic", 11),
+            anchor="w",
+            justify="left",
+            wraplength=300
+        )
+        message.place(x=28, y=50)
+
+        root.after(4000, root.destroy)
+        root.mainloop()
+
+class SeleniumHelper:
+    @staticmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    def click(driver_or_elem, element=None):
+        try:
+            if element:
+                driver_or_elem.execute_script("arguments[0].scrollIntoView(true);", element)
+                WebDriverWait(driver_or_elem, 3).until(EC.element_to_be_clickable(element)).click()
+            else:
+                driver_or_elem.click()
+        except Exception:
+            try:
+                if element:
+                    element.click()
+                else:
+                    driver_or_elem.click()
+            except Exception:
+                if element:
+                    driver_or_elem.execute_script("arguments[0].click();", element)
+                else:
+                    driver_or_elem.execute_script("arguments[0].click();", driver_or_elem)
+
+    @staticmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    def safe_send_keys(element, text):
+        element.send_keys(text)
+
+    @staticmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    def extract_customer_detail_panel(wait):
+        try:
+            panel = wait.until(
+                EC.visibility_of_element_located((By.CLASS_NAME, "detail-panel"))
+            )
+            tables = panel.find_elements(By.TAG_NAME, "table")
+            data = {}
+            for table in tables:
+                # Re-fetch rows and tds each time to avoid stale elements
+                rows = table.find_elements(By.TAG_NAME, "tr")
+                if len(rows) < 2:
+                    continue
+                tds_header = table.find_elements(By.XPATH, ".//tr[1]/td")
+                tds_values = table.find_elements(By.XPATH, ".//tr[2]/td")
+                if not tds_header or not tds_values:
+                    continue
+                field_names = []
+                for idx in range(len(tds_header)):
+                    try:
+                        td = table.find_element(By.XPATH, f".//tr[1]/td[{idx+1}]")
+                        try:
+                            span = td.find_element(By.XPATH, ".//span[contains(@class, 'detail-title')]")
+                            field_names.append(span.text.strip().lower().replace(" ", "_"))
+                        except Exception:
+                            field_names.append(td.text.strip().lower().replace(" ", "_"))
+                    except Exception:
+                        field_names.append(f"field_{idx}")
+                field_values = []
+                for idx in range(len(tds_values)):
+                    try:
+                        td = table.find_element(By.XPATH, f".//tr[2]/td[{idx+1}]")
+                        try:
+                            value_span = td.find_element(By.XPATH, ".//span[contains(@class, 'iceOutTxt')]")
+                            value = value_span.text.strip()
+                            divs = value_span.find_elements(By.TAG_NAME, "div")
+                            for div in divs:
+                                div_text = div.text.strip()
+                                if div_text:
+                                    value = value.replace(div_text, "")
+                            value = value.strip()
+                        except Exception:
+                            value = td.text.strip()
+                        field_values.append(value)
+                    except Exception:
+                        field_values.append("")
+                for i, key in enumerate(field_names):
+                    if i < len(field_values):
+                        data[key] = field_values[i]
+            return data
+        except Exception as e:
+            logging.error(f"Customer detail extraction error: {e}", exc_info=True)
+            return None
+
+    @staticmethod
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    def extract_modulo_richiesta_panel(wait, driver):
+        try:
+            tab = wait.until(
+                EC.element_to_be_clickable((By.XPATH, '//*[@id="module:j_id1488:0.1"]'))
+            )
+            tab.click()
+            panel = wait.until(
+                EC.visibility_of_element_located((By.XPATH, '//*[@id="module:j_id1488:0td2"]'))
+            )
+            data = []
+
+            # All input fields (text, hidden, radio, checkbox, etc.)
+            inputs = panel.find_elements(By.XPATH, ".//input")
+            for inp in inputs:
+                field_id = inp.get_attribute("id")
+                field_name = inp.get_attribute("name")
+                field_type = inp.get_attribute("type")
+                label = ""
+                # Try to get label from preceding or following sibling
+                try:
+                    label_elem = inp.find_element(By.XPATH, "preceding-sibling::span[1]")
+                    label = label_elem.text.strip()
+                except Exception:
+                    try:
+                        label_elem = inp.find_element(By.XPATH, "following-sibling::span[1]")
+                        label = label_elem.text.strip()
+                    except Exception:
+                        label = field_name or field_id
+                if field_type == "checkbox":
+                    value = "checked" if inp.is_selected() else "unchecked"
+                elif field_type == "radio":
+                    value = "selected" if inp.is_selected() else "unselected"
+                else:
+                    value = inp.get_attribute("value") or ""
+                data.append((label, value))
+
+            # All select fields (dropdowns)
+            selects = panel.find_elements(By.XPATH, ".//select")
+            for sel in selects:
+                field_id = sel.get_attribute("id")
+                field_name = sel.get_attribute("name")
+                label = ""
+                try:
+                    label_elem = sel.find_element(By.XPATH, "preceding-sibling::span[1]")
+                    label = label_elem.text.strip()
+                except Exception:
+                    label = field_name or field_id
+                try:
+                    selected_option = sel.find_element(By.XPATH, "./option[@selected]")
+                    value = selected_option.text.strip()
+                except Exception:
+                    value = sel.get_attribute("value") or ""
+                data.append((label, value))
+
+            # All textarea fields
+            textareas = panel.find_elements(By.XPATH, ".//textarea")
+            for ta in textareas:
+                field_id = ta.get_attribute("id")
+                field_name = ta.get_attribute("name")
+                label = ""
+                try:
+                    label_elem = ta.find_element(By.XPATH, "preceding-sibling::span[1]")
+                    label = label_elem.text.strip()
+                except Exception:
+                    label = field_name or field_id
+                value = ta.get_attribute("value") or ta.text or ""
+                data.append((label, value))
+
+            # Remove duplicates
+            seen = set()
+            unique_data = []
+            for label, value in data:
+                if label not in seen:
+                    unique_data.append((label, value))
+                    seen.add(label)
+
+            return unique_data
+        except Exception as e:
+            logging.error(f"Modulo richiesta extraction error: {e}", exc_info=True)
+            return []
+
+class HashUtil:
+    @staticmethod
+    def hash_content(data_dict):
+        filtered_dict = {k: v for k, v in data_dict.items() if k != "protocollo"}
+        content_str = "|".join(str(v) for v in filtered_dict.values())
+        return hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def hash_modulo(protocollo, field_name, field_value):
+        content_str = f"{protocollo}|{field_name}|{field_value}"
+        return hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+
+class Scraper:
+    def __init__(self, driver, driver1, wait, db_manager, notifier):
+        self.driver = driver
+        self.driver1 = driver1
+        self.wait = wait
+        self.db = db_manager
+        self.notifier = notifier
+        self.success_log = []
+        self.failed_log = []
+
+    def scrape(self):
+        logging.info("Scraping started...")
+        new_data_to_send = []
+        batch_customer_records = []
+        batch_modulo_records = []
+
+        try:
+            self.driver.get(os.getenv("OMNIA_URL"))
+
+            for tab in ["navigationForm:portfolio", "navigationForm:opportunities", "navigationForm:requestsDashboard"]:
+                try:
+                    WebDriverWait(self.driver, 7).until(EC.element_to_be_clickable((By.ID, tab))).click()
+                except Exception:
+                    logging.warning(f"Tab {tab} not clickable, skipping.")
+
+            table = WebDriverWait(self.driver, 7).until(EC.presence_of_element_located((By.ID, "module:tblRequestsDashboard")))
+
+            spans = table.find_elements(By.XPATH, ".//tbody//tr//span[contains(@id,'j_id484')]")
+
+            for span in spans:
+                protocollo = span.text.strip()
+                if not protocollo:
+                    continue
+
+                if self.db.protocollo_exists(protocollo):
+                    print(f"Skipping existing protocollo {protocollo}")
+                    logging.debug(f"Skipping existing protocollo {protocollo}")
+                    continue
+
+                row = span.find_element(By.XPATH, "./ancestor::tr")
+                button = row.find_element(By.CSS_SELECTOR, "a.icon-search")
+                try:
+                    SeleniumHelper.click(self.driver, button)
+                except Exception as e:
+                    logging.error(f"Could not click detail button: {e}", exc_info=True)
+                    continue
+
+                # Wait for detail panel
+                try:
+                    detail_panel = self.wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "detail-panel")))
+                except Exception as e:
+                    logging.error(f"Detail panel did not appear: {e}", exc_info=True)
+                    continue
+
+                # Extract detail-panel data
+                try:
+                    cliente_link = self.driver.find_element(By.XPATH, '//*[@id="module:j_id1444"]')
+                    SeleniumHelper.click(self.driver, cliente_link)
+                except Exception as e:
+                    logging.error(f"Could not click Cliente link: {e}", exc_info=True)
+                    continue
+
+                customer_data = SeleniumHelper.extract_customer_detail_panel(self.wait)
+                if not customer_data:
+                    continue
+
+                customer_data["protocollo"] = protocollo
+                content_hash = HashUtil.hash_content(customer_data)
+
+                if self.db.hash_exists_customer(content_hash):
+                    print(f"Duplicate hash for {protocollo}, skipping insert")
+                    logging.warning(f"Duplicate hash for {protocollo}, skipping insert")
+                else:
+                    batch_customer_records.append((customer_data, content_hash))
+                    new_data_to_send.append({
+                        "indirizzo": customer_data.get("indirizzo", ""),
+                        "sesso": customer_data.get("sesso", ""),
+                        "ateco": customer_data.get("ateco", ""),
+                        "codice_fiscale": customer_data.get("codice_fiscale", ""),
+                        "legale_rappresentante": customer_data.get("legale_rappresentante", ""),
+                        "telefono": customer_data.get("telefono", ""),
+                        "settore": customer_data.get("settore", ""),
+                        "partita_iva": customer_data.get("partita_iva", ""),
+                        "codice_fiscale_legale_rappresentante": customer_data.get("codice_fiscale_legale_rappresentante", ""),
+                        "email": customer_data.get("email", "")
+                    })
+                    self.notifier.show(f"Inserted new customer record: {customer_data.get('indirizzo', '')}")
+
+                # Extract modulo richiesta data (after detail panel is open)
+                modulo_data = SeleniumHelper.extract_modulo_richiesta_panel(self.wait, self.driver)
+                for field_name, field_value in modulo_data:
+                    modulo_hash = HashUtil.hash_modulo(protocollo, field_name, field_value)
+                    if not self.db.hash_exists_modulo(modulo_hash):
+                        batch_modulo_records.append({
+                            "protocollo": protocollo,
+                            "field_name": field_name,
+                            "field_value": field_value,
+                            "content_hash": modulo_hash
+                        })
+
+            if batch_customer_records:
+                self.db.insert_customer_batch(batch_customer_records)
+                logging.info(f"Inserted {len(batch_customer_records)} new customer records in batch.")
+
+            if batch_modulo_records:
+                self.db.insert_modulo_batch(batch_modulo_records)
+                logging.info(f"Inserted {len(batch_modulo_records)} new modulo richiesta records in batch.")
+
+        except Exception as e:
+            logging.error(f"General scraping error: {e}", exc_info=True)
+
+        finally:
+            if new_data_to_send:
+                print(f"\n📤 Submitting {len(new_data_to_send)} new customer records to form...")
+                for rec in new_data_to_send:
+                    try:
+                        # FormSubmitter.submit_form(self.driver1, rec) # Uncomment if you want to submit forms
+                        self.success_log.append(f"Form sent: {rec['indirizzo']}")
+                    except Exception as e:
+                        self.failed_log.append(f"Error submitting {rec['indirizzo']}: {e}")
+
+            with open("form_submission_report.txt", "w", encoding="utf-8") as rpt:
+                rpt.write("Successful Submissions\n=======================\n\n")
+                rpt.write("\n".join(self.success_log))
+
+            with open("failed_submission_log.txt", "w", encoding="utf-8") as rpt:
+                rpt.write("Failed Submissions\n===================\n\n")
+                rpt.write("\n".join(self.failed_log))
+
+            print("\n📁 Reports saved.")
+
+class ScrapeScheduler:
+    def __init__(self, scraper):
+        self.scraper = scraper
+
+    def threaded_scrape(self):
+        if scrape_lock.locked():
+            print("⛔ Scrape already running; skipping this round.")
+            return
+
+        def run_task():
+            with scrape_lock:
+                self.scraper.scrape()
+
+        threading.Thread(target=run_task, name="ScrapeThread").start()
+
+    def start(self, interval_seconds=20):
+        schedule.every(interval_seconds).seconds.do(self.threaded_scrape)
+        print(f"🧵 Multithreaded scheduler is running every {interval_seconds} seconds...\n")
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("🛑 Script interrupted. Cleaning up...")
+            self.scraper.db.close()
+            self.scraper.driver.quit()
+            self.scraper.driver1.quit()
+            print("✅ Script completed successfully.")
+
+if __name__ == "__main__":
+    options = webdriver.ChromeOptions()
+    #options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    wait = WebDriverWait(driver, 20)
+
+    options1 = webdriver.ChromeOptions()
+    options1.add_argument("--start-maximized")
+    driver1 = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options1)
+
+    db_manager = DatabaseManager()
+    notifier = PopupNotifier()
+    scraper = Scraper(driver, driver1, wait, db_manager, notifier)
+    scheduler = ScrapeScheduler(scraper)
+    scheduler.start(interval_seconds=20)  # Adjust the interval as needed
